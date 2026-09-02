@@ -7,7 +7,8 @@ import { underGraft, main, lastFileScopeHint, promptAskTimeout } from '../src/cl
 import { readStats, readSession } from '../src/claude/state.js';
 import { runSync } from '../src/claude/sync-run.js';
 import { savingsLine } from '../src/context/savings.js';
-import { writeStats, emptyStats, acquireLock } from '../src/claude/state.js';
+import { CI_ENV_VARS } from '../src/telemetry/gate.js';
+import { writeStats, emptyStats, acquireLock, resolveContextDir } from '../src/claude/state.js';
 
 test('underGraft detects edits inside graft/', () => {
   assert.equal(underGraft('/repo', '/repo/graft/x.md'), true);
@@ -19,7 +20,7 @@ test('post-edit marks dirty and records lastFile', async () => {
   mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
   writeFileSync(join(d, 'graft', '.graph', 'wiring.json'),
     JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
-  // graft check will fail (no dist/cli.js here) → staleCount falls back to 0, but dirty must still be set.
+  // post-edit no longer runs `graft check` at all (removed: too slow on large repos) — just dirty + lastFile.
   process.env.CLAUDE_PROJECT_DIR = d;
   const stdin = JSON.stringify({ tool_input: { file_path: join(d, 'src', 'auth.ts') } });
   await runWithStdin(stdin, () => main('post-edit'));
@@ -95,6 +96,31 @@ test('runSync clears dirty/syncing, recomputes stats, releases lock', () => {
   assert.equal(s.readyCount, 1);
   assert.ok(s.syncedAt);
   assert.equal(acquireLock(d), true, 'lock released, so reacquire succeeds');
+});
+
+test("runSync's default build passes --dir <resolved> to graft build when GRAFT_DIR is set", () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-sync-dir-'));
+  mkdirSync(join(d, 'elsewhere', '.graph'), { recursive: true });
+  const argsFile = join(d, 'args-seen.json');
+  const stub = join(d, 'build-stub.cjs');
+  writeFileSync(
+    stub,
+    `const fs = require('fs');\n` +
+      `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n` +
+      `fs.writeFileSync(${JSON.stringify(join(d, 'elsewhere', '.graph', 'wiring.json'))}, JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));\n`,
+  );
+  process.env.GRAFT_TEST_CLI = stub;
+  process.env.GRAFT_DIR = 'elsewhere';
+  try {
+    runSync(d); // exercises the real (non-injected) build path
+    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    const dirIdx = argsSeen.indexOf('--dir');
+    assert.ok(dirIdx !== -1, 'the build call carries --dir when GRAFT_DIR is set');
+    assert.equal(argsSeen[dirIdx + 1], resolveContextDir(d));
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.GRAFT_DIR;
+  }
 });
 
 test('runSync clears syncing even if build throws (money-safe failure)', () => {
@@ -441,6 +467,112 @@ test('tool-savings counts a REAL savings line (with the turn nudge) exactly once
   }
 });
 
+// ── the usage-mix counters: graft vs source (both hosts) ───────────────────
+
+test('tool-savings now scores the mix: a Read is a source read, a graft footer is a graft read', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-mix-'));
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    await runWithStdin(JSON.stringify({ session_id: 'm', tool_name: 'Read', tool_input: { file_path: '/x' } }), () => main('tool-savings'));
+    assert.equal(readSession(d, 'm').sourceReads, 1, 'Read counted as a source read');
+    assert.equal(readSession(d, 'm').graftReads, 0);
+
+    await runWithStdin(JSON.stringify({
+      session_id: 'm', tool_name: 'Bash',
+      tool_response: { stdout: '[graft] tokens saved ≈ 500 — …' },
+    }), () => main('tool-savings'));
+    assert.equal(readSession(d, 'm').graftReads, 1, 'a graft footer counts as a graft read');
+    assert.equal(readSession(d, 'm').savedTokens, 500);
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
+// ── Cursor hook adapters ────────────────────────────────────────────────────
+
+test('cursor-post-tool: Read → source read, Shell graft → graft read + savings, keyed by conversation_id', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-pt-'));
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    await runWithStdin(JSON.stringify({ conversation_id: 'c1', tool_name: 'Read', tool_input: {} }), () => main('cursor-post-tool'));
+    assert.equal(readSession(d, 'c1').sourceReads, 1);
+
+    await runWithStdin(JSON.stringify({
+      conversation_id: 'c1', tool_name: 'Shell',
+      tool_input: { command: 'graft ask "x"' },
+      tool_output: JSON.stringify({ stdout: '…\n[graft] tokens saved ≈ 900 — …' }),
+    }), () => main('cursor-post-tool'));
+    assert.equal(readSession(d, 'c1').graftReads, 1, 'Shell graft CLI is a graft read');
+    assert.equal(readSession(d, 'c1').savedTokens, 900, 'savings parsed out of tool_output');
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
+test('cursor-post-tool skips graft MCP tools — prefixed AND bare — so afterMCPExecution is the only counter', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-skip-'));
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    // prefixed shape
+    await runWithStdin(JSON.stringify({ conversation_id: 'c1', tool_name: 'MCP:graft_find_code', tool_output: '{}' }), () => main('cursor-post-tool'));
+    assert.equal(existsSync(join(d, 'graft', '.cache', 'session', 'c1.json')), false, 'prefixed MCP tool not counted here');
+    // bare shape — the guard, not just the installed matcher, must catch this or it double-counts
+    await runWithStdin(JSON.stringify({ conversation_id: 'c2', tool_name: 'graft_find_code', tool_output: '{}' }), () => main('cursor-post-tool'));
+    assert.equal(existsSync(join(d, 'graft', '.cache', 'session', 'c2.json')), false, 'bare graft MCP tool not counted here');
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
+test('cursor-mcp: a graft MCP tool is a graft read with savings from result_json; a foreign MCP tool is a no-op', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-mcp-'));
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    await runWithStdin(JSON.stringify({
+      conversation_id: 'c1', tool_name: 'graft_find_code',
+      result_json: JSON.stringify({ text: '…\n[graft] tokens saved ≈ 1,200 — …' }),
+    }), () => main('cursor-mcp'));
+    assert.equal(readSession(d, 'c1').graftReads, 1);
+    assert.equal(readSession(d, 'c1').savedTokens, 1200);
+
+    await runWithStdin(JSON.stringify({ conversation_id: 'c2', tool_name: 'some_other_server_tool', result_json: '{}' }), () => main('cursor-mcp'));
+    assert.equal(existsSync(join(d, 'graft', '.cache', 'session', 'c2.json')), false, 'foreign MCP tool ignored');
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
+test('cursor-session-end force-closes THIS conversation even though its file was just touched (idle gate skipped)', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-cursor-end-'));
+  const home = mkdtempSync(join(tmpdir(), 'graft-cursor-end-home-'));
+  mkdirSync(join(d, 'graft', '.cache', 'session'), { recursive: true });
+  const sfile = join(d, 'graft', '.cache', 'session', 'c1.json');
+  // mtime = now: the idle sweep would skip this, but the end hook must summarize it.
+  writeFileSync(sfile, JSON.stringify({ graftReads: 8, sourceReads: 2, savedTokens: 7400 }));
+
+  // Turn telemetry on against a scratch $HOME so the rollup actually queues (and
+  // marks the file), the observable proof the force-close ran — not just no-throw.
+  //
+  // EVERY CI variable has to go, not just `CI`: `inCi` is deliberately generous and
+  // also reads GITHUB_ACTIONS, GITLAB_CI and six more. Clearing `CI` alone passed on
+  // a laptop and failed on GitHub Actions, where GITHUB_ACTIONS is set — so the list
+  // comes from `CI_ENV_VARS` rather than being copied here, and cannot drift from it.
+  const scrubbed = ['HOME', 'USERPROFILE', 'GRAFT_POSTHOG_KEY', 'DO_NOT_TRACK', ...CI_ENV_VARS];
+  const saved = Object.fromEntries(scrubbed.map((k) => [k, process.env[k]]));
+  for (const k of [...CI_ENV_VARS, 'DO_NOT_TRACK']) delete process.env[k];
+  process.env.HOME = home; process.env.USERPROFILE = home;
+  process.env.GRAFT_POSTHOG_KEY = 'phc_test_key';
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    await runWithStdin(JSON.stringify({ conversation_id: 'c1' }), () => main('cursor-session-end'));
+    assert.equal(readSession(d, 'c1').summarized, true, 'the just-ended conversation was rolled up');
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+    for (const [k, v] of Object.entries(saved))
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+});
+
 /**
  * The prompt hook's `graft ask` child must stay inside the budget THIS repo has
  * installed, not the one the current source would install. `mergeGraftSettings` runs
@@ -518,4 +650,104 @@ test('promptAskTimeout reads a user-level hook when the repo declares none', () 
     if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = previous;
   }
+});
+
+// ── GRAFT_DIR: the hooks' own `graft ask`/`graft check` children, and the
+// SessionStart INDEX.md read, must land on the same relocated context dir
+// that readWiring/readStats/patchStats/acquireLock/session state already
+// resolve through resolveContextDir. ──────────────────────────────────────
+
+test('prompt hook passes --dir <resolved> to graft ask when GRAFT_DIR is set', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-prompt-dir-'));
+  mkdirSync(join(d, 'elsewhere', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'elsewhere', '.graph', 'wiring.json'),
+    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
+  const { stub, argsFile } = writeAskArgsStub(d);
+  process.env.CLAUDE_PROJECT_DIR = d;
+  process.env.GRAFT_TEST_CLI = stub;
+  process.env.GRAFT_DIR = 'elsewhere';
+  try {
+    await runWithStdin(
+      JSON.stringify({ session_id: 'p-dir', prompt: 'how does the relocated graph get queried' }),
+      () => main('prompt'),
+    );
+    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    const dirIdx = argsSeen.indexOf('--dir');
+    assert.ok(dirIdx !== -1, 'the ask call carries --dir when GRAFT_DIR is set');
+    assert.equal(argsSeen[dirIdx + 1], resolveContextDir(d));
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.CLAUDE_PROJECT_DIR;
+    delete process.env.GRAFT_DIR;
+  }
+});
+
+test('prompt hook omits --dir when GRAFT_DIR is unset (byte-identical argv to before)', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-prompt-dir-'));
+  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'graft', '.graph', 'wiring.json'),
+    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
+  const { stub, argsFile } = writeAskArgsStub(d);
+  process.env.CLAUDE_PROJECT_DIR = d;
+  process.env.GRAFT_TEST_CLI = stub;
+  try {
+    await runWithStdin(
+      JSON.stringify({ session_id: 'p-nodir', prompt: 'how does the default graph get queried' }),
+      () => main('prompt'),
+    );
+    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.equal(argsSeen.indexOf('--dir'), -1, 'unconfigured repo: no --dir added');
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
+test('post-edit passes --dir <resolved> to graft check when GRAFT_DIR is set', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-postedit-dir-'));
+  mkdirSync(join(d, 'elsewhere', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'elsewhere', '.graph', 'wiring.json'),
+    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
+  const stub = join(d, 'check-stub.cjs');
+  const argsFile = join(d, 'args-seen.json');
+  writeFileSync(
+    stub,
+    `const fs = require('fs');\n` +
+      `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n` +
+      `process.stdout.write(JSON.stringify({ graph: { changed: [], added: [], removed: [] } }));\n`,
+  );
+  process.env.CLAUDE_PROJECT_DIR = d;
+  process.env.GRAFT_TEST_CLI = stub;
+  process.env.GRAFT_DIR = 'elsewhere';
+  try {
+    const stdin = JSON.stringify({ tool_input: { file_path: join(d, 'src', 'auth.ts') } });
+    await runWithStdin(stdin, () => main('post-edit'));
+    const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    const dirIdx = argsSeen.indexOf('--dir');
+    assert.ok(dirIdx !== -1, 'the check call carries --dir when GRAFT_DIR is set');
+    assert.equal(argsSeen[dirIdx + 1], resolveContextDir(d));
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.CLAUDE_PROJECT_DIR;
+    delete process.env.GRAFT_DIR;
+  }
+});
+
+test('session-start reads INDEX.md from a GRAFT_DIR-relocated context dir', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-session-start-dir-'));
+  mkdirSync(join(d, 'elsewhere'), { recursive: true });
+  writeFileSync(join(d, 'elsewhere', 'INDEX.md'), '# repo map (relocated)\n');
+  process.env.CLAUDE_PROJECT_DIR = d;
+  process.env.GRAFT_DIR = 'elsewhere';
+  const chunks: string[] = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  (process.stdout as any).write = (s: any) => { chunks.push(String(s)); return true; };
+  try {
+    await runWithStdin('{}', () => main('session-start'));
+  } finally {
+    (process.stdout as any).write = orig;
+    delete process.env.CLAUDE_PROJECT_DIR;
+    delete process.env.GRAFT_DIR;
+  }
+  assert.match(chunks.join(''), /repo map \(relocated\)/, 'orientation was built from the relocated INDEX.md');
 });

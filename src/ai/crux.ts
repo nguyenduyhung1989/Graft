@@ -14,7 +14,8 @@
  * sees each symbol's neighbours, which sharpens the summaries. Line numbers are
  * consumed once, at write time, to slice the crux text verbatim from source.
  */
-import type { ChatModel } from "./llm/types.js";
+import type { ChatModel, ChatResponse } from "./llm/types.js";
+import { recoverToolArgsFromContent, warnToolChoiceIgnored } from "./llm/recover-tool.js";
 import type { Kind } from "../graph/types.js";
 
 /** One definition we want described, located by its line span within the file. */
@@ -41,6 +42,40 @@ export interface NodeCrux {
 
 export interface CruxSummarizer {
   describeFile(input: FileCruxInput): Promise<NodeCrux[]>;
+  /** Set by {@link ChatCruxSummarizer} after each call; optional on fakes. */
+  lastMiss?: CruxMiss | null;
+}
+
+/** Why a crux call produced no usable summaries (#235). */
+export type CruxMissKind = "empty-toolCalls" | "unparseable" | "truncated" | "empty-parsed";
+
+export interface CruxMiss {
+  kind: CruxMissKind;
+  finishReason: string | null;
+}
+
+function isTruncatedStop(reason: string | null): boolean {
+  if (!reason) return false;
+  const r = reason.toLowerCase();
+  return r === "length" || r === "max_tokens";
+}
+
+/** Classify an empty/unusable crux reply. `null` means at least one usable summary. */
+export function classifyCruxMiss(res: ChatResponse, parsed: NodeCrux[]): CruxMiss | null {
+  const finishReason = res.stopReason;
+  if (parsed.some((p) => p.summary.trim())) return null;
+  if (isTruncatedStop(finishReason)) return { kind: "truncated", finishReason };
+  if (parsed.length > 0) return { kind: "empty-parsed", finishReason };
+  const emptyTools = res.toolCalls.length === 0;
+  const emptyText = !res.text?.trim();
+  if (emptyTools && emptyText) return { kind: "empty-toolCalls", finishReason };
+  return { kind: "unparseable", finishReason };
+}
+
+/** Per-file error text: miss class + the provider's finish_reason (#235). */
+export function formatCruxMiss(kind: CruxMissKind, finishReason: string | null): string {
+  const fr = finishReason == null || finishReason === "" ? "null" : finishReason;
+  return `model returned no usable symbol summaries [${kind}, finish_reason=${fr}]`;
 }
 
 const SYSTEM_PROMPT = `You explain code definitions for a code graph that helps engineers navigate a codebase.
@@ -114,11 +149,36 @@ function parseResults(obj: { symbols?: unknown } | undefined): NodeCrux[] {
     }));
 }
 
+/**
+ * Some OpenAI-compatible gateways ignore forced `tool_choice` and put the tool
+ * payload in `content` instead (plain `{symbols:…}`, fenced JSON, or an emulated
+ * `[{name, parameters}]` array). Without this recovery the meaning pass sees an
+ * empty `toolCalls` list, leaves every node `pending`, and `graft check` loops
+ * on "run --deep" forever (#172; same trigger as #129 for the crux path).
+ */
+function argsFromResponse(res: { text: string; toolCalls: { name: string; args: unknown }[] }): {
+  symbols?: unknown;
+} | undefined {
+  const call = res.toolCalls.find((c) => c.name === RECORD_TOOL) ?? res.toolCalls[0];
+  if (call?.args && typeof call.args === "object" && !Array.isArray(call.args)) {
+    return call.args as { symbols?: unknown };
+  }
+  const recovered = recoverToolArgsFromContent(res.text, {
+    toolNames: [RECORD_TOOL, "emit_json"],
+    payloadKey: "symbols",
+  });
+  if (!recovered) warnToolChoiceIgnored("crux", res.text?.trim() ? "unparsed" : "empty");
+  return recovered as { symbols?: unknown } | undefined;
+}
+
 /** Crux summarizer backed by any {@link ChatModel} via forced tool calling. */
 export class ChatCruxSummarizer implements CruxSummarizer {
+  lastMiss: CruxMiss | null = null;
+
   constructor(private model: ChatModel) {}
 
   async describeFile(input: FileCruxInput): Promise<NodeCrux[]> {
+    this.lastMiss = null;
     if (input.nodes.length === 0) return [];
     const res = await this.model.create({
       temperature: 0,
@@ -136,6 +196,8 @@ export class ChatCruxSummarizer implements CruxSummarizer {
         { role: "user", content: userContent(input) },
       ],
     });
-    return parseResults(res.toolCalls[0]?.args as { symbols?: unknown } | undefined);
+    const parsed = parseResults(argsFromResponse(res));
+    this.lastMiss = classifyCruxMiss(res, parsed);
+    return parsed;
   }
 }

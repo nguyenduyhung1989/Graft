@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { extname, join } from "node:path";
 import { supportedExtensions } from "../graph/source-files.js";
+import { isMarkdownPath } from "../graph/markdown.js";
 import { shouldSkipDir } from "../ingest/fs.js";
 
 /** Most entries one ignored folder's walk looks at before giving up on it. */
@@ -48,12 +49,14 @@ export function ignoredCode(root: string, limit = 20): string[] {
     windowsHide: true,
   });
   if (r.status !== 0 || typeof r.stdout !== "string") return [];
-  const exts = new Set(supportedExtensions());
+  const exts = new Set(supportedExtensions().filter((ext) => ext !== ".md" && ext !== ".markdown"));
   const out: string[] = [];
   for (const entry of r.stdout.split("\n")) {
     if (!entry) continue;
     if (entry.replace(/\/$/, "").split("/").some((p) => shouldSkipDir(p))) continue;
-    const code = entry.endsWith("/") ? holdsCode(join(root, entry), exts) : exts.has(extname(entry).toLowerCase());
+    const code = entry.endsWith("/")
+      ? holdsCode(join(root, entry), exts)
+      : !isMarkdownPath(entry) && exts.has(extname(entry).toLowerCase());
     if (code) out.push(entry);
     if (out.length >= limit) break;
   }

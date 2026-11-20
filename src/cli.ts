@@ -524,7 +524,7 @@ grouped(program.command("build"), GROUP.setup)
   .option("--check", "build nothing: fail if graft/ is stale relative to the code (for CI)")
   .option("--json", "with --check: output the drift as JSON")
   .option("--deep", "run the LLM pass: concept nodes (graft/*.md) + per-symbol summary/crux")
-  .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".ts" ".py"); an extension with no parser is ignored with a warning that lists the supported set')
+  .option("-e, --extensions <exts...>", 'source extensions to include (e.g. ".ts" ".py" ".md"); an extension with no extractor is ignored with a warning that lists the supported set')
   .option("-j, --concurrency <n>", "files summarized in parallel during --deep (default 5)")
   .option(
     "--synth-concurrency <n>",

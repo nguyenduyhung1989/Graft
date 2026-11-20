@@ -1,19 +1,20 @@
 /**
- * `graph.json` — the code graph schema (v1).
+ * `graph.json` — the code and opt-in Markdown graph schema (v1).
  *
- * One node per definition (file, class, function, method, interface, type, enum),
+ * One node per definition (file, section, class, function, method, interface, type, enum),
  * wired by edges (contains, imports, calls, ...). Field names follow the LSP
  * vocabulary (`name`, `kind`, ...) rather than any one tool's conventions.
  *
  * Two tiers of data live on a node:
- *   - Tier-1 (deterministic, $0): everything from the AST. Rebuilt on every run.
+ *   - Tier-1 (deterministic, $0): extracted code structure or Markdown structure.
  *   - Tier-2 (one LLM call, cached on `body_hash`): `summary` + `crux`.
  * M1 populates Tier-1 only; Tier-2 fields ship as `pending`/null.
  */
 
-/** What a node represents. LSP SymbolKind, narrowed to what our extractors produce. */
+/** What a node represents in the code and Markdown extractors. */
 export type Kind =
   | "file"
+  | "section" // Markdown heading
   | "class"
   | "function"
   | "method"
@@ -70,18 +71,17 @@ export interface NodeV1 {
   span: string; // whole definition: "L165-L222"
   signature: string | null; // "get(k: string): number" — null for kind:"file"
   exported: boolean;
-  // How the node was extracted. "ast" = a first-class hand-written extractor
-  // (TS/JS/Python/Go, full-fidelity). "generic" = the tags.scm breadth tier
-  // (signature-only; symbols + bare edges, no scope-aware binding).
-  origin: "ast" | "generic";
+  // How the node was extracted: ast is the full-fidelity code extractor, generic
+  // is the tags.scm breadth tier, and doc is the hand-written Markdown tier.
+  origin: "ast" | "generic" | "doc";
   body_hash: string; // sha256 of the definition text; the Tier-2 re-run trigger
   chars?: number; // byte length of the WHOLE file (file nodes only); the baseline
   //                 `ask` uses to estimate tokens saved vs reading the file whole
-  body_text?: string; // searchable whitespace-normalized definition body (Tier-1,
-  //                 symbol nodes only, capped). Ranks `ask` queries so a term in
-  //                 the code — not just the name/signature — is findable; never
+  body_text?: string; // searchable whitespace-normalized source body (Tier-1,
+  //                 symbols, sections, and file residuals; capped). Ranks ask queries so a term in
+  //                 the source — not just the name/signature — is findable; never
   //                 emitted to the agent (that reads verbatim source via `--source`).
-  //                 Absent on file nodes and on graphs built before this field.
+  //                 Older graphs may not have the field.
   arity?: number; // declared parameter count (method/constructor nodes). Disambiguates
   //                 OVERLOADS, which only Java has among the languages parsed here: two
   //                 same-named methods on one class are otherwise separable only by

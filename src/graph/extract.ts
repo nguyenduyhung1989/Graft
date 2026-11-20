@@ -117,6 +117,12 @@ export interface RawEdge {
    * no such member — and ONLY then, so a name defined as both a member and a
    * free function yields the member edge alone, exactly as Swift dispatches it. */
   implicitSelf?: boolean;
+  /** Markdown links are resolved against the completed page index in resolve.ts. */
+  markdownLink?: {
+    kind: "wikilink" | "relative";
+    target: string;
+    heading?: string;
+  };
 }
 
 export interface ExtractResult {

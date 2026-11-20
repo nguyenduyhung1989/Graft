@@ -14,6 +14,7 @@ import { tierOf, warmGrammarsFor } from "../graph/build.js";
 import { extractContainer } from "../graph/container.js";
 import { extractFile } from "../graph/extract.js";
 import { extractGeneric } from "../graph/generic.js";
+import { extractMarkdown } from "../graph/markdown.js";
 import type { NodeV1 } from "../graph/types.js";
 import { readBranchCache, safeRef, type BranchCache } from "./branches.js";
 import { flatLine } from "./flatten.js";
@@ -95,8 +96,10 @@ function withComment(s: CodeSymbol, lines: string[]): CodeSymbol {
 export async function symbolsIn(rel: string, source: string): Promise<CodeSymbol[]> {
   try {
     await warmGrammarsFor([rel]);
-    const { lang, container, generic } = tierOf(rel);
-    const nodes = lang
+    const { markdown, lang, container, generic } = tierOf(rel);
+    const nodes = markdown
+      ? extractMarkdown(rel, source).nodes
+      : lang
       ? extractFile(rel, source, lang).nodes
       : container
         ? extractContainer(rel, source, container).nodes

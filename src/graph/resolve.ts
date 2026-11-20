@@ -17,6 +17,7 @@ import { toPosixPath } from "../util/paths.js";
 import type { EdgeV1, Kind, NodeV1, Relation } from "./types.js";
 import { languageOf, type RawEdge } from "./extract.js";
 import { genericLangOf } from "./generic.js";
+import { isMarkdownPath } from "./markdown.js";
 import { resolveTsAlias, type TsPathConfig } from "./ts-paths.js";
 
 const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py"];
@@ -114,6 +115,81 @@ function reachable(file: string, candidatePath: string): boolean {
   return to === null || from === to;
 }
 
+function markdownStem(path: string): string {
+  const extension = posix.extname(path).toLowerCase();
+  return extension === ".md" || extension === ".markdown" ? path.slice(0, -extension.length) : path;
+}
+
+function markdownHeadingKey(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function markdownHeadingSlug(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\p{M}_ -]/gu, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
+}
+
+function decodeMarkdownPath(path: string): string {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+}
+
+function uniqueMarkdownPage(pages: Map<string, NodeV1[]>, key: string): NodeV1 | null {
+  const matches = pages.get(key) ?? [];
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function markdownHeadingTarget(
+  page: NodeV1,
+  fragment: string | undefined,
+  exact: Map<string, Map<string, NodeV1[]>>,
+  slugs: Map<string, Map<string, NodeV1[]>>,
+): string {
+  if (!fragment) return page.id;
+  const key = markdownHeadingKey(decodeMarkdownPath(fragment.replace(/^#/, "")));
+  const exactMatches = exact.get(page.id)?.get(key) ?? [];
+  if (exactMatches.length === 1) return exactMatches[0]!.id;
+  if (exactMatches.length > 1) return page.id;
+  const slugMatches = slugs.get(page.id)?.get(markdownHeadingSlug(key)) ?? [];
+  return slugMatches.length === 1 ? slugMatches[0]!.id : page.id;
+}
+
+function resolveMarkdownPage(
+  edge: RawEdge,
+  byPath: Map<string, NodeV1>,
+  byBaseName: Map<string, NodeV1[]>,
+  bySuffix: Map<string, NodeV1[]>,
+): NodeV1 | null {
+  const link = edge.markdownLink;
+  if (!link) return null;
+  const rawTarget = decodeMarkdownPath(link.target.split("?", 1)[0] ?? link.target).replace(/\\/g, "/");
+  if (!rawTarget || rawTarget.startsWith("#") || rawTarget.startsWith("//") || /^[A-Za-z][A-Za-z\d+.-]*:/.test(rawTarget)) return null;
+
+  if (link.kind === "relative") {
+    const extension = posix.extname(rawTarget).toLowerCase();
+    if (extension !== ".md" && extension !== ".markdown") return null;
+    const target = posix.normalize(posix.join(posix.dirname(edge.file), rawTarget));
+    if (target === ".." || target.startsWith("../") || target.startsWith("/")) return null;
+    return byPath.get(target) ?? null;
+  }
+
+  const extension = posix.extname(rawTarget).toLowerCase();
+  if (extension && extension !== ".md" && extension !== ".markdown") return null;
+  const stem = markdownStem(rawTarget).replace(/^\.\//, "").replace(/^\/+/, "");
+  if (!stem) return null;
+  const key = stem.toLowerCase();
+  return stem.includes("/")
+    ? uniqueMarkdownPage(bySuffix, key)
+    : uniqueMarkdownPage(byBaseName, key);
+}
+
 /** A Go module discovered in the repo: its `module` path from `go.mod` and the repo
  * directory that `go.mod` lives in (posix, `.` for the repo root). A monorepo may hold
  * several — e.g. `backend/go.mod`, `tools/go.mod`. */
@@ -143,6 +219,11 @@ export function resolveEdges(
   // Owner-qualified method index: "Owner.method" → candidate method nodes, for
   // typed member-call resolution (recvType + name → a specific class's method).
   const ownerMethod = new Map<string, NodeV1[]>();
+  const markdownPagesByPath = new Map<string, NodeV1>();
+  const markdownPagesByBaseName = new Map<string, NodeV1[]>();
+  const markdownPagesBySuffix = new Map<string, NodeV1[]>();
+  const markdownHeadingsExact = new Map<string, Map<string, NodeV1[]>>();
+  const markdownHeadingsBySlug = new Map<string, Map<string, NodeV1[]>>();
   // Go package resolution: dir (posix) → its `.go` file node ids, for import mapping.
   const goFilesByDir = new Map<string, string[]>();
   // Java package resolution: a file's package-path suffix (`com/acme/Foo.java`) → its
@@ -169,6 +250,13 @@ export function resolveEdges(
   const hasGoModules = !!opts.goModules?.length;
   for (const n of nodes) {
     if (n.kind === "file") {
+      if (isMarkdownPath(n.path)) {
+        markdownPagesByPath.set(n.path, n);
+        const stem = markdownStem(n.path);
+        push(markdownPagesByBaseName, posix.basename(stem).toLowerCase(), n);
+        const parts = stem.toLowerCase().split("/");
+        for (let i = 0; i < parts.length; i++) push(markdownPagesBySuffix, parts.slice(i).join("/"), n);
+      }
       if (hasGoModules && n.path.endsWith(".go")) {
         const dir = posix.dirname(toPosixPath(n.path));
         push(goFilesByDir, dir, n.id);
@@ -198,6 +286,14 @@ export function resolveEdges(
         else if (p.endsWith("/lib.rs") || p.endsWith("/main.rs")) rustCrateRoots.push(posix.dirname(p));
       }
       continue;
+    }
+    if (n.kind === "section" && isMarkdownPath(n.path)) {
+      let exact = markdownHeadingsExact.get(n.path);
+      if (!exact) markdownHeadingsExact.set(n.path, (exact = new Map()));
+      push(exact, markdownHeadingKey(n.name), n);
+      let slugs = markdownHeadingsBySlug.get(n.path);
+      if (!slugs) markdownHeadingsBySlug.set(n.path, (slugs = new Map()));
+      push(slugs, markdownHeadingSlug(n.name), n);
     }
     push(globalName, n.name, n);
     let fileMap = perFileName.get(n.path);
@@ -253,7 +349,12 @@ export function resolveEdges(
   };
 
   for (const e of rawEdges) {
-    if (e.relation === "contains" && e.targetId) {
+    if (e.relation === "references" && e.markdownLink) {
+      const page = resolveMarkdownPage(e, markdownPagesByPath, markdownPagesByBaseName, markdownPagesBySuffix);
+      if (!page) continue;
+      const target = markdownHeadingTarget(page, e.markdownLink.heading, markdownHeadingsExact, markdownHeadingsBySlug);
+      add(e.source, target, "references", "extracted");
+    } else if (e.relation === "contains" && e.targetId) {
       add(e.source, e.targetId, "contains", "extracted");
     } else if (e.relation === "imports" && e.specifier) {
       const target =

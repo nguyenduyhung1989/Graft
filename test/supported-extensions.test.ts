@@ -1,7 +1,7 @@
 /**
  * `-e` extension validation (#98): a `graft build -e "<ext>"` must not silently index
- * nothing — the CLI warns on any extension no parser claims. These test the pure helper
- * the warning is built on: the supported set (depth + breadth + container) and which
+ * nothing — the CLI warns on any extension no extractor claims. These test the pure helper
+ * the warning is built on: the supported set (depth + breadth + container + Markdown) and which
  * inputs fall outside it, including normalization (leading dot optional, case-insensitive).
  *
  * `.vue` was the extension originally reported in #98 and is used below as a
@@ -15,7 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { supportedExtensions, unsupportedExtensions } from "../src/graph/source-files.js";
 
-test("supportedExtensions covers both tiers, sorted and de-duped", () => {
+test("supportedExtensions covers all extractor tiers, sorted and de-duped", () => {
   const exts = supportedExtensions();
   // depth tier
   for (const e of [".ts", ".tsx", ".py", ".go", ".java", ".js", ".php", ".kt", ".kts", ".swift"]) assert.ok(exts.includes(e), `depth ${e}`);
@@ -23,18 +23,20 @@ test("supportedExtensions covers both tiers, sorted and de-duped", () => {
   for (const e of [".rs", ".rb", ".c", ".cpp", ".gleam", ".glsl"]) assert.ok(exts.includes(e), `breadth ${e}`);
   // container tier
   for (const e of [".vue", ".svelte", ".astro"]) assert.ok(exts.includes(e), `container ${e}`);
+  // opted-in Markdown tier
+  for (const e of [".md", ".markdown"]) assert.ok(exts.includes(e), `Markdown ${e}`);
   // de-duped (.java is in BOTH tiers but must appear once) and sorted
   assert.equal(exts.filter((e) => e === ".java").length, 1, ".java de-duped across tiers");
   assert.deepEqual(exts, [...exts].sort(), "sorted");
 });
 
-test("unsupportedExtensions flags only what has no parser (the #98 repro)", () => {
-  // no parser → flagged
+test("unsupportedExtensions flags only what has no extractor (the #98 repro)", () => {
+  // no extractor → flagged
   assert.deepEqual(unsupportedExtensions([".hbs"]), [".hbs"]);
   // mixed: supported ones drop out, unsupported stay
   assert.deepEqual(unsupportedExtensions([".ts", ".vue", ".rs", ".hbs"]), [".hbs"]);
-  // fully-supported input → nothing flagged, container tier included
-  assert.deepEqual(unsupportedExtensions([".ts", ".php", ".c", ".vue", ".svelte", ".astro"]), []);
+  // fully-supported input → nothing flagged, container and Markdown tiers included
+  assert.deepEqual(unsupportedExtensions([".ts", ".php", ".c", ".vue", ".svelte", ".astro", ".md", ".markdown"]), []);
 });
 
 test("extension normalization: missing dot and mixed case still match a parser", () => {

@@ -454,7 +454,7 @@ export function savedTokensBucket(n: number): string {
  * The character filter is the part that matters. This is the only property in
  * the contract that is not drawn from a closed set defined in this file: the
  * values come from the parser registry, several modules away, via
- * `languageLabelOf() ?? container.name ?? generic.name ?? "unknown"`. That is
+ * `markdownLabelOf() ?? languageLabelOf() ?? container.name ?? generic.name ?? "unknown"`. That is
  * safe today, but it means the no-free-text guarantee would rest on a promise
  * made elsewhere — and a future generic extractor naming itself after the
  * extension it matched would quietly turn this into a channel for file

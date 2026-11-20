@@ -14,11 +14,14 @@ import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "..
 import { languageOf, depthExtensions } from "./extract.js";
 import { genericLangOf, genericExtensions } from "./generic.js";
 import { containerLangOf, containerExtensions } from "./container.js";
+import { isMarkdownPath, markdownExtensions } from "./markdown.js";
 
-/** Every extension graft has a parser for (depth + breadth + container), sorted
+const MARKDOWN_EXTENSIONS = new Set(markdownExtensions());
+
+/** Every extension graft extracts (depth + breadth + container + Markdown), sorted
  * and de-duped — the authoritative answer to "what does `-e` actually support". */
 export function supportedExtensions(): string[] {
-  return [...new Set([...depthExtensions(), ...genericExtensions(), ...containerExtensions()])].sort();
+  return [...new Set([...depthExtensions(), ...genericExtensions(), ...containerExtensions(), ...markdownExtensions()])].sort();
 }
 
 /** Normalize a user-supplied extension: ensure a leading dot, lower-case. */
@@ -33,7 +36,7 @@ export function normalizeExtensions(exts?: readonly string[]): string[] | undefi
 }
 
 /**
- * The subset of user-supplied `-e` extensions that no parser claims (depth or breadth).
+ * The subset of user-supplied `-e` extensions that no extractor claims.
  * `graft build -e ".vue"` used to accept these silently and index nothing; the CLI warns
  * on whatever this returns so an unsupported extension is never a quiet no-op.
  */
@@ -43,7 +46,7 @@ export function unsupportedExtensions(exts: string[]): string[] {
 }
 
 /**
- * The source files a graph build parses: supported languages, minus the
+ * The source files a graph build extracts: supported code languages and opted-in Markdown, minus the
  * output dir. When no pre-enumerated `repoFiles` is passed, the walk reads
  * `root`'s persisted file-walk choices directly from state, so every caller
  * that enumerates through here (the fingerprint probe and hooks/refresh path,
@@ -77,16 +80,19 @@ export function listSourceFiles(
   extensions?: readonly string[],
 ): string[] {
   const selected = normalizeExtensions(extensions);
+  const markdownSelected = selected?.some((ext) => MARKDOWN_EXTENSIONS.has(ext)) ?? false;
   // A file is a source file if a depth-tier grammar (languageOf), a breadth-tier
-  // grammar (genericLangOf) or a container (containerLangOf) claims its extension.
-  // All three must agree here or `build` and `check` would enumerate different sets.
+  // grammar (genericLangOf), a container (containerLangOf), or the opt-in Markdown
+  // scanner claims its extension. Markdown stays out of the default set so README
+  // headings cannot compete with code symbols unless the caller selected it.
   return filterByOnlyDirs(
-    repoFiles.filter(
-      (f) =>
-        !f.startsWith(outDir) &&
-        (!selected || selected.includes(extname(f).toLowerCase())) &&
-        (languageOf(f) !== null || genericLangOf(f) !== null || containerLangOf(f) !== null),
-    ),
+    repoFiles.filter((f) => {
+      const markdown = isMarkdownPath(f);
+      return !f.startsWith(outDir)
+        && (!selected || selected.includes(extname(f).toLowerCase()))
+        && (!markdown || markdownSelected)
+        && (markdown || languageOf(f) !== null || genericLangOf(f) !== null || containerLangOf(f) !== null);
+    }),
     root,
     onlyDirs,
   );

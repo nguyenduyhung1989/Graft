@@ -14,6 +14,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { relPosix } from "../../util/paths.js";
 import { languageLabelOf } from "../extract.js";
+import { markdownLabelOf } from "../markdown.js";
 import { genericLangOf } from "../generic.js";
 import type { GraphV1, NodeV1, EdgeV1 } from "../types.js";
 import { LspClient } from "./client.js";
@@ -22,7 +23,7 @@ import { pickServers } from "./registry.js";
 const CALLABLE = new Set<NodeV1["kind"]>(["function", "method"]);
 const DEFN = new Set<NodeV1["kind"]>(["function", "method", "class", "struct", "interface", "type", "enum"]);
 
-const langOf = (path: string): string | null => genericLangOf(path)?.name ?? languageLabelOf(path);
+const langOf = (path: string): string | null => genericLangOf(path)?.name ?? languageLabelOf(path) ?? markdownLabelOf(path);
 
 interface Span { node: NodeV1; from: number; to: number }
 const parseSpan = (s: string): [number, number] | null => {

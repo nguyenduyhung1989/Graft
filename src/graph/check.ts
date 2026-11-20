@@ -1,7 +1,7 @@
 /**
  * `checkGraph` — is the committed `graph.json` still in sync with the code?
  *
- * Deterministic and fast (tree-sitter only, no LLM, no network): it re-runs
+ * Deterministic and fast (structural extractors only, no LLM, no network): it re-runs
  * Tier-1 extraction and diffs the fresh node set against the committed graph by
  * `id` and `body_hash`. Meant for CI — exit non-zero when a PR changed code but
  * didn't rebuild the graph.
@@ -23,6 +23,7 @@ import { contextDirFor } from "../context/node-file.js";
 import { extractFile } from "./extract.js";
 import { extractGeneric } from "./generic.js";
 import { extractContainer } from "./container.js";
+import { extractMarkdown } from "./markdown.js";
 import { listSourceFiles, tierOf, warmGrammarsFor } from "./build.js";
 import { readGraph, wiringPath } from "./write.js";
 import { readFingerprint } from "./fingerprint.js";
@@ -100,7 +101,7 @@ export async function checkGraph(
     // The same dispatch `buildGraph` uses (`tierOf`). The two must stay in step: a
     // tier the build extracts and the check cannot see reports as `removed`
     // forever, and the `graft build` the check tells you to run can never repair it.
-    const { lang, container, generic } = tierOf(file);
+    const { markdown, lang, container, generic } = tierOf(file);
     let source: string | null;
     try {
       source = readSourceFile(file);
@@ -110,7 +111,9 @@ export async function checkGraph(
     if (source === null) continue; // unsupported encoding (e.g. UTF-16BE)
     const rel = relPosix(root, file);
     try {
-      const extracted = lang
+      const extracted = markdown
+        ? extractMarkdown(rel, source)
+        : lang
         ? extractFile(rel, source, lang)
         : container
           ? extractContainer(rel, source, container)

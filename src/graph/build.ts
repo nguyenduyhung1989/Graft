@@ -20,6 +20,7 @@ import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/no
 import { extractFile, languageLabelOf, languageOf, type Language, type RawEdge } from "./extract.js";
 import { extractGeneric, fallbackLangOf, genericLangOf, warmGenericGrammars, type GenericLang } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars, type ContainerLang } from "./container.js";
+import { extractMarkdown, isMarkdownPath, markdownLabelOf } from "./markdown.js";
 import { depthReady, missingDepthPackages, warmDepthGrammars } from "./depth-parser.js";
 import type { NativeFallback } from "./native.js";
 import { contentHash } from "../util/id.js";
@@ -51,14 +52,15 @@ export { listSourceFiles } from "./source-files.js";
  * Which tier extracts a file. {@link buildGraph} and `checkGraph` both dispatch on
  * this, so a tier the build extracts can never be one the check can't see.
  *
- * Depth tier (hand-written extractor) when a language claims the file and its
- * grammar loads (depth-parser.ts). When it doesn't load, the file goes to that
+ * Markdown tier when explicitly selected; depth tier (hand-written extractor)
+ * when a language claims the file and its grammar loads. When it doesn't load, the file goes to that
  * language's stand-in in the breadth tier and `fellBack` names the language. A
  * container (.vue) is checked before the breadth tier so a future grammar claiming
  * its extension can't shadow it; anything else goes to the breadth tier (generic
  * tags.scm over a WASM grammar).
  */
 export interface FileTier {
+  markdown: boolean;
   lang: Language | null;
   container: ContainerLang | null;
   generic: GenericLang | null;
@@ -66,15 +68,16 @@ export interface FileTier {
 }
 
 export function tierOf(path: string): FileTier {
+  if (isMarkdownPath(path)) return { markdown: true, lang: null, container: null, generic: null, fellBack: null };
   const depth = languageOf(path);
   if (depth) {
     return depthReady(depth)
-      ? { lang: depth, container: null, generic: null, fellBack: null }
-      : { lang: null, container: null, generic: fallbackLangOf(depth), fellBack: depth };
+      ? { markdown: false, lang: depth, container: null, generic: null, fellBack: null }
+      : { markdown: false, lang: null, container: null, generic: fallbackLangOf(depth), fellBack: depth };
   }
   const container = containerLangOf(path);
-  if (container) return { lang: null, container, generic: null, fellBack: null };
-  return { lang: null, container: null, generic: genericLangOf(path), fellBack: null };
+  if (container) return { markdown: false, lang: null, container, generic: null, fellBack: null };
+  return { markdown: false, lang: null, container: null, generic: genericLangOf(path), fellBack: null };
 }
 
 /** Load every WASM grammar these files need, before a synchronous parse loop can
@@ -270,8 +273,8 @@ export async function buildGraph(
   files.forEach((f, i) => {
     const rel = f.rel;
     opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
-    const { lang, container, generic, fellBack: standIn } = tierOf(f.abs);
-    const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
+    const { markdown, lang, container, generic, fellBack: standIn } = tierOf(f.abs);
+    const label = markdownLabelOf(f.abs) ?? languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
     // A .vue file's embedded script falls back the same way its language does.
     const inner = container && !depthReady(container.inner) ? container.inner : null;
     if (standIn) {
@@ -338,7 +341,9 @@ export async function buildGraph(
 
     parsed++;
     try {
-      const { nodes: fileNodes, rawEdges: fileEdges } = lang
+      const { nodes: fileNodes, rawEdges: fileEdges } = markdown
+        ? extractMarkdown(rel, source)
+        : lang
         ? extractFile(rel, source, lang)
         : container
           ? extractContainer(rel, source, container)

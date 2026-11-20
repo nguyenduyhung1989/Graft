@@ -21,6 +21,11 @@
  * (or a suspicious user, since the repo is public) reads to verify the claim.
  */
 
+/** Init's own kinds as `cold_start` counts them: skill, guardrail (always follow), preference (learning). */
+export const INIT_KINDS = ['skills', 'always_follow', 'learnings'] as const;
+/** An exact count up to init's 5 items, then one label. */
+const SMALL_COUNTS = ['0', '1', '2', '3', '4', '5', '6+'] as const;
+
 /* -------------------------------------------------------------------------- */
 /* the event → allowed-property-keys map                                      */
 /* -------------------------------------------------------------------------- */
@@ -42,15 +47,64 @@ export const EVENTS: Record<string, ReadonlySet<string>> = {
    *  `install`, the gap between the two is the top of the funnel. */
   first_run: new Set<string>(),
   /** `graft init` completed. Tells us which agents people actually wire, and
-   *  how many decline telemetry at the picker. */
-  init_completed: new Set<string>(['agents', 'consent']),
+   *  how many decline telemetry at the picker. `statusline` says whose status
+   *  line Claude Code shows in the repo afterwards: trail's, the one the person
+   *  or their team already had, or none (`--no-statusline`). `scope`: who trail is for in
+   *  the repo (`just_me`/`team`, or `unasked` when nobody chose). */
+  init_completed: new Set<string>(['agents', 'consent', 'statusline', 'scope']),
   /** A build finished. The activation event — an install that never reaches one
-   *  of these is the funnel leak we most want to see. */
-  build_completed: new Set<string>(['files_bucket', 'langs', 'mode', 'duration_bucket', 'incremental']),
+   *  of these is the funnel leak we most want to see. `overlap`: another build or
+   *  sync of the same map was already running when this one started. */
+  build_completed: new Set<string>(['files_bucket', 'langs', 'mode', 'duration_bucket', 'incremental', 'overlap']),
   /** A build threw. `stage`/`code` are enums; the message never travels. */
   build_failed: new Set<string>(['stage', 'code']),
   /** One query, from any surface. The DAU backbone and the dead-command detector. */
-  query: new Set<string>(['command', 'surface', 'hit']),
+  query: new Set<string>(['command', 'surface', 'hit', 'notes', 'stale']),
+  /** A trail command handing the agent a sign-in link to pass on. Queued the
+   *  moment the link is printed, so a sign-in somebody walked away from is still
+   *  counted — the settle below never fires for those. */
+  brain_signup_opened: new Set<string>(['mode', 'command', 'wording']),
+  /** That handoff reaching an end. `outcome` is a closed set, so the reason a
+   *  signup failed travels as a category and never as the error's own words. */
+  brain_signup_settled: new Set<string>(['outcome', 'mode', 'duration_bucket']),
+  /** `trail note` saved a session note (into `~/.trail/`). Whether it carries
+   *  a cost, and how many files it is about, as a bucket, and whether it went
+   *  into the learning this session already saved (`into`). The title, the text
+   *  and the paths never travel. The supply side of the notes loop; the
+   *  `notes` property on `query` is the demand side. */
+  note_saved: new Set<string>(['has_cost', 'touches_bucket', 'scope', 'into']),
+  /** The Stop hook asked the agent to save a learning, read on the stop after:
+   *  the sign that raised it (`kind`), and whether a learning was saved in
+   *  answer (`saved`: in the repo, just for the person, or not). The share of
+   *  `kind=corrected` asks with a learning saved is how many corrections
+   *  become learnings. The transcript and the learning never travel. */
+  note_asked: new Set<string>(['kind', 'saved', 'form']),
+  /** Once a day per repo, from the session-start hook, for a repo trail runs
+   *  in: whether `.trail/` is committed there, how many learnings it holds,
+   *  as a bucket, and whether this machine shares it with a workspace. With
+   *  `repo_id` and the install id this counts devs and repos touched, and
+   *  repos with Trail committed. Paths and names never travel. */
+  repo_seen: new Set<string>(['trail_committed', 'learnings_bucket', 'workspace']),
+  /** At session start, when the learnings committed on HEAD went up since the
+   *  last session in that clone: how many came in and how many there are, as
+   *  buckets, and whether it's the clone's first look. Committed learnings
+   *  are trail's activation. Paths and titles never travel. */
+  learnings_committed: new Set<string>(['added_bucket', 'total_bucket', 'first_look']),
+  /** Once a session at most: a reply that credited a learning asked "did it
+   *  help? yes/no", and the person's next prompt answered (`none` when it moved
+   *  on, or the session closed unanswered). The vote and the learning's id; the
+   *  prompt never travels. */
+  learning_rated: new Set<string>(['vote', 'learning_id']),
+  /** `trail init` read the repo's past Claude sessions, the review comments
+   *  on its merged PRs, or Claude Code's memory notes of it (`source`), for
+   *  learnings: how it went, how many sessions or reviewed PRs there were,
+   *  findings offered and saved, how many were left out for naming no code
+   *  (`filtered`), and how many of those offered and saved were the team's,
+   *  as buckets, how long it took, and the model. The look-back's own items
+   *  offered (shown or relayed) and kept, by kind, as exact counts (init shows
+   *  at most 5). The messages, the comments, the notes and the findings never travel. */
+  cold_start: new Set<string>(['source', 'outcome', 'sessions_bucket', 'reviews_bucket', 'offered_bucket', 'filtered_bucket', 'picked_bucket', 'team_offered_bucket', 'team_picked_bucket', 'duration_bucket', 'model',
+    ...INIT_KINDS.flatMap((k) => [`offered_${k}`, `kept_${k}`])]),
   /** One closed agent session, summarised. `graft_reads` vs `source_reads` is
    *  the single number that says whether an agent prefers graft to grep; the two
    *  `*_turns` buckets are the follow-up question — of the turns that used graft,
@@ -59,7 +113,135 @@ export const EVENTS: Record<string, ReadonlySet<string>> = {
     'graft_reads_bucket', 'source_reads_bucket', 'saved_tokens_bucket',
     'graft_turns_bucket', 'reported_turns_bucket',
   ]),
+
+  /* Learned skills (spec section 20). Every value is a member of a closed set
+   * in {@link VALUES}; a skill's name, its steps, a command, a prompt, a lesson
+   * or a path is never one of them, so none of those can travel. */
+
+  /** Trail offered to keep a skill (or a lesson, an update, a promotion): at which moment. */
+  skill_offered: new Set<string>(['moment']),
+  /** The person's answer to an offer. A withdrawn offer sends nothing. */
+  skill_answer: new Set<string>(['answer']),
+  /** A skill was saved: what it came from, and whose it is. */
+  skill_saved: new Set<string>(['from', 'scope']),
+  /** Trail changed a skill it wrote, on the person's yes or their own command (phase 2): how. */
+  skill_changed: new Set<string>(['op']),
+  /** A skill moved up a scope (phase 3). */
+  skill_promoted: new Set<string>(['to']),
+  /** A joined team repo was pulled (phase 3): how it went. */
+  team_pull: new Set<string>(['outcome']),
+  /** A skill the agent was given ran: whether its own check passed. */
+  skill_used: new Set<string>(['outcome']),
+  /** The weekly value line was said (phase 2): where it went. */
+  skill_value: new Set<string>(['channel']),
+  /** A skill stopped being offered to the agent as is: why. */
+  skill_stale: new Set<string>(['reason']),
+  /** A guardrail fired: which built-in one, and what it did. */
+  guardrail: new Set<string>(['class', 'outcome']),
+  /** A failing command matched a known wall: which one, and whether the person had kept a lesson for it. */
+  wall_hit: new Set<string>(['class', 'had_lesson']),
+  /** After an edit, the agent was told a pushed branch, a teammate's or the
+   *  person's own other one, changes the same function: whether GitHub lists
+   *  an open pull request for it, and whose it is. */
+  overlap_warned: new Set<string>(['pr', 'whose']),
+  /** Later that session, the person's prompt named that teammate or branch. */
+  overlap_acted: new Set<string>(['pr', 'whose']),
+  /** Learnings reached the agent because it opened, edited or named a file
+   *  they list: how, and whether the file was a worktree's copy while the
+   *  session's project is the main checkout. */
+  learnings_on_touch: new Set<string>(['via', 'worktree']),
+  /** How long one hook took, as a bucket: which hook. */
+  hook_ms: new Set<string>(['event', 'bucket']),
+  /** A Trail teammate sent one of their Claude Code sessions to the Trail
+   *  team (`trail share-session`, internal only): its size and how many
+   *  messages, as buckets. The session itself goes to Trail on the person's
+   *  yes, never through telemetry; nothing of it is in this event. */
+  session_shared: new Set<string>(['size_bucket', 'messages_bucket']),
+  /** A Trail teammate's answer to sending their whole Claude (`trail
+   *  share-session` with no session named, internal only): sent, sent with
+   *  folders left out, declined, taken back with the delete code, or its
+   *  keep-sending stopped; and how many items and how big, as buckets.
+   *  Nothing of the bundle is in it. */
+  share_bundle: new Set<string>(['outcome', 'items_bucket', 'size_bucket']),
 };
+
+/** The answers {@link EVENTS.share_bundle} reports. */
+export const SHARE_BUNDLE_OUTCOMES = ['sent', 'partial', 'declined', 'deleted', 'stopped'] as const;
+/** The labels {@link shareItemsBucket} returns. */
+export const SHARE_ITEMS_BUCKETS = ['1', '2-9', '10-49', '50-199', '200+'] as const;
+/** The labels {@link shareSizeBucket} returns. */
+export const SHARE_SIZE_BUCKETS = ['<1MB', '1-10MB', '10-50MB', '50-200MB', '200MB+'] as const;
+
+/** The labels {@link sessionSizeBucket} returns. */
+export const SESSION_SIZE_BUCKETS = ['<100KB', '100KB-1MB', '1-5MB', '5-20MB', '20MB+'] as const;
+/** The labels {@link sessionMessagesBucket} returns. */
+export const SESSION_MESSAGES_BUCKETS = ['<50', '50-199', '200-499', '500-1999', '2000+'] as const;
+
+/** The labels {@link hookMsBucket} returns. */
+export const HOOK_MS_BUCKETS = ['<50ms', '50-100ms', '100-300ms', '300ms-1s', '1-3s', '3s+'] as const;
+
+/**
+ * The values an event's key may take, where the contract fixes them. `track()`
+ * drops a value outside the set, key and all, so a call site that passes a
+ * skill's name, a prompt or an error line under an allowed key sends nothing
+ * for it. Every key of the skills events is listed here.
+ */
+export const VALUES: Record<string, Record<string, ReadonlySet<string>>> = {
+  learning_rated: { vote: new Set(['up', 'down', 'none']) },
+  init_completed: { statusline: new Set(['trail', 'theirs', 'off']), scope: new Set(['just_me', 'team', 'unasked']) },
+  cold_start: Object.fromEntries(INIT_KINDS.flatMap((k) => [`offered_${k}`, `kept_${k}`]).map((key) => [key, new Set(SMALL_COUNTS)])),
+  note_asked: {
+    kind: new Set(['fixed', 'corrected', 'undone', 'chose', 'overrode', 'shipped', 'explored']),
+    saved: new Set(['repo', 'personal', 'no']),
+    form: new Set(['block', 'feedback']),
+  },
+  skill_offered: { moment: new Set(['asked', 'repeated', 'repaired', 'correction', 'update', 'drift', 'retire', 'promote']) },
+  skill_answer: { answer: new Set(['yes', 'no', 'show', 'none', 'off', 'retire']) },
+  skill_changed: { op: new Set(['update', 'extend', 'split', 'replace', 'retire', 'adopted', 'restore-version']) },
+  skill_value: { channel: new Set(['context', 'notice', 'list']) },
+  skill_saved: { from: new Set(['init', 'repeated', 'repaired', 'asked']), scope: new Set(['personal', 'repo', 'team']) },
+  skill_promoted: { to: new Set(['repo', 'team']) },
+  team_pull: { outcome: new Set(['updated', 'unchanged', 'diverged', 'failed']) },
+  skill_used: { outcome: new Set(['checked', 'failed', 'unchecked']) },
+  skill_stale: { reason: new Set(['failed', 'corrected', 'missing', 'unused', 'unfollowed']) },
+  learnings_on_touch: { via: new Set(['read', 'edit', 'command']), worktree: new Set(['true', 'false']) },
+  guardrail: {
+    class: new Set(['no-timeout', 'prod-after-beta']),
+    outcome: new Set(['hint', 'ask', 'deny', 'sure-fail', 'avoided']),
+  },
+  overlap_warned: { pr: new Set(['open', 'none', 'unknown']), whose: new Set(['mine', 'teammate']) },
+  overlap_acted: { pr: new Set(['open', 'none', 'unknown']), whose: new Set(['mine', 'teammate']) },
+  wall_hit: {
+    class: new Set(['timeout-missing', 'zsh-no-match', 'git-https-auth', 'docker-rootless', 'npm-e401-eotp', 'claude-not-logged-in', 'enospc']),
+    had_lesson: new Set(['true', 'false']),
+  },
+  hook_ms: {
+    event: new Set(['session-start', 'prompt', 'pre-bash', 'pre-edit', 'tool-savings', 'post-bash', 'post-bash-fail', 'post-edit', 'post-edit-sync', 'stop']),
+    bucket: new Set(HOOK_MS_BUCKETS),
+  },
+  session_shared: {
+    size_bucket: new Set(SESSION_SIZE_BUCKETS),
+    messages_bucket: new Set(SESSION_MESSAGES_BUCKETS),
+  },
+  share_bundle: {
+    outcome: new Set(SHARE_BUNDLE_OUTCOMES),
+    items_bucket: new Set(SHARE_ITEMS_BUCKETS),
+    size_bucket: new Set(SHARE_SIZE_BUCKETS),
+  },
+};
+
+/** Keys whose values are ids of one fixed shape: a learning's id is `l-` and hex, as in its file, never its title. */
+export const SHAPES: Record<string, Record<string, RegExp>> = {
+  learning_rated: { learning_id: /^l-[0-9a-f]{6,16}$/ },
+};
+
+/** Whether `value` may go under `key` of `event`: always, unless {@link VALUES} fixes the key's values or {@link SHAPES} its shape. */
+export function allowedValue(event: string, key: string, value: string): boolean {
+  if (Object.hasOwn(SHAPES, event) && Object.hasOwn(SHAPES[event]!, key)) return SHAPES[event]![key]!.test(value);
+  if (!Object.hasOwn(VALUES, event)) return true;
+  const keys = VALUES[event]!;
+  return !Object.hasOwn(keys, key) || keys[key]!.has(value);
+}
 
 /** Stamped on every event by `track()`; not listed per event above. */
 export const COMMON_KEYS = [
@@ -69,6 +251,7 @@ export const COMMON_KEYS = [
   'node_major',
   'ci',
   'agent_host',
+  'cli_name',
   'repo_id',
 ] as const;
 
@@ -80,9 +263,11 @@ export const COMMON_KEYS = [
  *  queries on the user's behalf without them typing a command. */
 export type Surface = 'cli' | 'mcp' | 'hook';
 
-/** Which editor/agent graft is running under. Derived from the surface and the
- *  wiring on disk — never from a hostname, a username, or an env var's value. */
-export type AgentHost = 'claude-code' | 'cursor' | 'mcp' | 'cli';
+/** Which editor/agent graft is running under. Derived from the surface, the
+ *  hook payload and the wiring on disk — never from a hostname, a username, or
+ *  an env var's value beyond matching one fixed name. `claude-desktop` is
+ *  Claude Code inside the Claude desktop app's Code tab. */
+export type AgentHost = 'claude-code' | 'claude-desktop' | 'codex' | 'cursor' | 'copilot' | 'mcp' | 'cli';
 
 /**
  * The commands worth counting. A command absent here is simply not reported —
@@ -97,6 +282,20 @@ export type TrackedCommand = (typeof TRACKED_COMMANDS)[number];
 export function isTrackedCommand(name: string): name is TrackedCommand {
   return (TRACKED_COMMANDS as readonly string[]).includes(name);
 }
+
+/**
+ * How a sign-in handoff ended.
+ *
+ * Five categories and nothing else, because the alternative — the error string
+ * the CLI already prints — carries a repo slug and a URL. `timed_out` and
+ * `no_tty` are deliberately apart: one is a person who opened the browser and
+ * did not finish, the other is a machine that was never able to open one, and
+ * treating them alike would read as a product problem where there is only a
+ * remote shell. `stopped` is Ctrl-C while waiting: a person changing their
+ * mind, not a browser that never came back.
+ */
+export const BRAIN_SIGNUP_OUTCOMES = ['linked', 'timed_out', 'no_tty', 'bad_callback', 'stopped'] as const;
+export type BrainSignupOutcome = (typeof BRAIN_SIGNUP_OUTCOMES)[number];
 
 /** Where a failing build died. Coarse on purpose: enough to route a bug, not
  *  enough to describe anyone's repo. */
@@ -176,6 +375,62 @@ export function countBucket(n: number): string {
   if (n < 50) return '20-49';
   if (n < 200) return '50-199';
   return '200+';
+}
+
+/** `{prefix}_skills`, `{prefix}_always_follow`, `{prefix}_learnings`: how many of each kind, exact to 5. */
+export function initKindCounts(prefix: 'offered' | 'kept', items: ReadonlyArray<{ kind: string }>): Record<string, string> {
+  const n = (kind: string) => items.filter((i) => i.kind === kind).length;
+  const small = (c: number) => (c > 5 ? '6+' : String(c));
+  return { [`${prefix}_skills`]: small(n('skill')), [`${prefix}_always_follow`]: small(n('guardrail')), [`${prefix}_learnings`]: small(n('preference')) };
+}
+
+/** One hook's wall-clock. The budgets are 50 ms (PreToolUse) and 300 ms (the
+ *  rest), so the labels split there. */
+export function hookMsBucket(ms: number): (typeof HOOK_MS_BUCKETS)[number] {
+  if (ms < 50) return '<50ms';
+  if (ms < 100) return '50-100ms';
+  if (ms < 300) return '100-300ms';
+  if (ms < 1000) return '300ms-1s';
+  if (ms < 3000) return '1-3s';
+  return '3s+';
+}
+
+/** A shared session's size, redacted, before zipping. */
+export function sessionSizeBucket(bytes: number): (typeof SESSION_SIZE_BUCKETS)[number] {
+  const kb = bytes / 1024;
+  if (kb < 100) return '<100KB';
+  if (kb < 1024) return '100KB-1MB';
+  if (kb < 5 * 1024) return '1-5MB';
+  if (kb < 20 * 1024) return '5-20MB';
+  return '20MB+';
+}
+
+/** How many messages a shared session has, tool calls and results included. */
+export function sessionMessagesBucket(n: number): (typeof SESSION_MESSAGES_BUCKETS)[number] {
+  if (n < 50) return '<50';
+  if (n < 200) return '50-199';
+  if (n < 500) return '200-499';
+  if (n < 2000) return '500-1999';
+  return '2000+';
+}
+
+/** How many items a shared bundle has: sessions, plus its setup. */
+export function shareItemsBucket(n: number): (typeof SHARE_ITEMS_BUCKETS)[number] {
+  if (n <= 1) return '1';
+  if (n < 10) return '2-9';
+  if (n < 50) return '10-49';
+  if (n < 200) return '50-199';
+  return '200+';
+}
+
+/** A shared bundle's size, zipped. */
+export function shareSizeBucket(bytes: number): (typeof SHARE_SIZE_BUCKETS)[number] {
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1) return '<1MB';
+  if (mb < 10) return '1-10MB';
+  if (mb < 50) return '10-50MB';
+  if (mb < 200) return '50-200MB';
+  return '200MB+';
 }
 
 /** Estimated tokens saved in one session — the README's central claim, in the

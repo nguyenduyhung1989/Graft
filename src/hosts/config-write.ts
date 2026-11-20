@@ -40,7 +40,19 @@ export function writeOwned(id: string, path: string, content: string, mode?: num
  *  `?? ''` guards a stray `undefined` entry: `JSON.stringify(undefined)` is
  *  `undefined`, whose `.includes` would throw. */
 export function isGraftEntry(entry: unknown): boolean {
-  return JSON.stringify(entry ?? '').includes('graft-hooks.cjs');
+  const s = JSON.stringify(entry ?? '');
+  return s.includes('graft-hooks.cjs') || s.includes('trail-hooks.cjs') || s.includes('/.trail/hook.cjs');
+}
+
+/** What marks `trail share-session`'s hook: trail's shim, called with the `share-sync` event. */
+const SHARE_SYNC_MARK = '-hooks.cjs" share-sync';
+
+/** Whether a hooks-config entry is `trail share-session`'s keep-sending hook. It calls trail's
+ *  shim, so `isGraftEntry` matches it too, but it isn't part of the set an upgrade rewrites: it's
+ *  there because the person said yes, and only `--stop` or `--delete` take it out. */
+export function isShareSyncEntry(entry: unknown): boolean {
+  const hooks = (entry as { hooks?: unknown } | null | undefined)?.hooks;
+  return Array.isArray(hooks) && hooks.some((h) => typeof h?.command === 'string' && h.command.includes(SHARE_SYNC_MARK));
 }
 
 /**

@@ -118,11 +118,23 @@ export function migrationNote(children: string[]): string {
   );
 }
 
+/** The parent's `graft/` is deleted wholesale below, so it must not be someone's
+ * repository: a child repo named `graft` sits exactly there. */
+function assertParentGraftDisposable(root: string, override?: string): void {
+  const dir = contextDirFor(root, override);
+  if (!existsSync(join(dir, ".git"))) return;
+  throw new Error(
+    `refusing to build a workspace at ${root}: ${dir} is a git checkout, and the workspace ` +
+      `index would delete it. Rename that folder, or build inside one repo instead.`,
+  );
+}
+
 /** Remove the parent's entire `graft/` tree — the mega-graph, its `.cache`, and
  * any stale cards — so after `writeWorkspace` the parent holds ONLY
  * workspace.json. Child graphs live in sibling `<child>/graft/`, never under
  * this dir, so they are untouched. */
 export function clearParentGraft(root: string, override?: string): void {
+  assertParentGraftDisposable(root, override);
   rmSync(contextDirFor(root, override), { recursive: true, force: true });
 }
 
@@ -713,6 +725,7 @@ export async function splitWorkspace(
   buildChild: (childDir: string, childName: string) => Promise<void>,
   onStart?: (info: { children: string[]; migrated: boolean }) => void,
 ): Promise<{ children: string[]; migrated: boolean }> {
+  assertParentGraftDisposable(root, override);
   const children = discoverWorkspaceChildren(root).slice().sort();
   const migrated = hasMegaGraph(root, override);
   onStart?.({ children, migrated });

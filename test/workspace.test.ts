@@ -533,3 +533,16 @@ test("readWorkspace: rejects foreign/invalid json as not-a-workspace", () => {
   assert.deepEqual(readWorkspace(p), { version: 1, children: ["a", "x"] });
   rmSync(p, { recursive: true, force: true });
 });
+
+test("splitWorkspace refuses to wipe a parent graft/ that is a git checkout", async () => {
+  // A child repo literally named `graft` sits exactly where the workspace index goes.
+  const p = workspaceFx({ ...REPOS, graft: { "keep.ts": "export const keep = 1;\n" } });
+  try {
+    await assert.rejects(buildWorkspace(p), /git checkout/);
+    assert.ok(existsSync(join(p, "graft", "keep.ts")), "the child repo's source survives");
+    assert.ok(existsSync(join(p, "graft", ".git")), "the child repo's history survives");
+    assert.ok(!existsSync(join(p, "repoA", "graft")), "it refuses before building anything");
+  } finally {
+    rmSync(p, { recursive: true, force: true });
+  }
+});

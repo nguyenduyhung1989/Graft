@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { BRAND_ENV } from '../src/brand.js';
 import { mergeGraftHooks, mergeGraftSettings, mergeTrailLocal, mergeTrailShared } from '../src/claude/settings-merge.js';
 import { installCodexHooks } from '../src/hosts/codex-hooks.js';
-import { handlePrompt, PROMPT_BUDGET_MS, promptAskTimeout } from '../src/claude/prompt-hook.js';
+import { handlePrompt, PROMPT_BUDGET_MS, promptAskTimeout, promptBudgetMs } from '../src/claude/prompt-hook.js';
 import { writeNote } from '../src/notes/notes.js';
 import { tmpRepo } from './helpers.js';
 import { timeBar } from './machine-speed.js';
@@ -164,6 +164,12 @@ test('the default budget holds a never-answering ask to a few seconds, whatever 
   } finally {
     delete process.env.GRAFT_TEST_CLI;
   }
+});
+
+test('GRAFT_PROMPT_BUDGET_MS widens the budget for a big repo; anything unusable keeps the default', () => {
+  assert.equal(promptBudgetMs({}), PROMPT_BUDGET_MS);
+  assert.equal(promptBudgetMs({ GRAFT_PROMPT_BUDGET_MS: '8000' }), 8000);
+  for (const bad of ['', '0', '-5', 'soon']) assert.equal(promptBudgetMs({ GRAFT_PROMPT_BUDGET_MS: bad }), PROMPT_BUDGET_MS, bad);
 });
 
 /** Whether a process is gone, waiting up to `ms` for it. */

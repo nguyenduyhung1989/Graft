@@ -45,6 +45,13 @@ export const MIN_CUE_CHARS = 3;
  * ask took 13 s at p95 before this (the lab, on main).
  */
 export const PROMPT_BUDGET_MS = 4000;
+/** The budget in force: PROMPT_BUDGET_MS unless GRAFT_PROMPT_BUDGET_MS names a
+ * positive number, for a repo whose ask alone takes about as long as the default.
+ * The installed hook timeout still caps the ask (see promptAskTimeout). */
+export function promptBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  const ms = Number(env.GRAFT_PROMPT_BUDGET_MS);
+  return Number.isFinite(ms) && ms > 0 ? ms : PROMPT_BUDGET_MS;
+}
 /** Kept back after the ask for the hook's own work: format, write the session, emit. */
 const AFTER_ASK_MS = 250;
 /** An ask with less time than this left isn't started: it would only be cut off. */
@@ -262,7 +269,7 @@ export function promptWords(raw: unknown): string {
 export async function handlePrompt(input: any, dir: string, opts: { budgetMs?: number } = {}): Promise<void> {
   // Background completion notices are machine events, not user queries: no skills answer, no ask (#551).
   if (String(input?.prompt ?? '').trimStart().startsWith('<task-notification>')) return;
-  const deadline = Date.now() + (opts.budgetMs ?? PROMPT_BUDGET_MS);
+  const deadline = Date.now() + (opts.budgetMs ?? promptBudgetMs());
   // `/name` for one of the repo's skills is a run of it; the name only goes.
   recordSkillUse(skillOfPrompt(input?.prompt), input, dir);
   // A prompt naming the teammate or branch an overlap warning named: the person acted on it.
